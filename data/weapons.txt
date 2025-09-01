@@ -1,0 +1,9 @@
+pistol
+rifle
+AK-47
+shotgun
+bomb
+missile
+grenade
+knife
+explosive
