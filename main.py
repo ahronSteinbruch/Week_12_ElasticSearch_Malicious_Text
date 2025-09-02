@@ -12,6 +12,6 @@ if __name__ == "__main__":
     enricher = Enriche(index_name="tweets", weapons_file_path='./data/weapons.txt')
 
     # Run the weapons enrichment process
-    enricher.add_weapons_to_docs(size=10000) # Adjust size as needed for your dataset
+    enricher.add_weapons_to_docs() # Adjust size as needed for your dataset
     # Run the sentiment enrichment process
-    enricher.add_sentiment_to_docs(size=10000) # Adjust size as needed
+    enricher.add_sentiment_to_docs() # Adjust size as needed

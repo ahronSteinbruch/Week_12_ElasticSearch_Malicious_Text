@@ -2,10 +2,16 @@ import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from elasticsearch import helpers
+import logging
+from typing import List, Dict, Optional
 
 # Import your actual Elasticsearch connection and DAL classes
 from Elastic_service.connection import ConnES
 from Elastic_service.DAL import DAL
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Download vader_lexicon if not already present
 try:
@@ -20,245 +26,240 @@ class Enriche:
     It identifies weapons in text and calculates sentiment, then updates
     the documents with this new information.
     """
-    def __init__(self, index_name="tweets", weapons_file_path='./data/weapons.txt'):
-        """
-        Initializes the Enrichement class.
 
-        Args:
-            index_name (str): The name of the Elasticsearch index to work with.
-            weapons_file_path (str): Path to the file containing the list of weapons.
-        """
+    def __init__(self, index_name="tweets", weapons_file_path='./data/weapons.txt'):
+        self.index_name = index_name
         self.es = ConnES.get_instance().connect()
         self.dal = DAL(index_name=index_name, create_index=True)
-        self.index_name = index_name
         self.sid = SentimentIntensityAnalyzer()
         self.weapons_list = self._load_weapons(weapons_file_path)
-        print(f"Enrichement class initialized for index: '{self.index_name}'")
+        self._ensure_mapping()
+        logger.info(f"Enrichement class initialized for index: '{self.index_name}'")
 
-    def _load_weapons(self, file_path):
-        """
-        Loads the weapons list from a specified file.
-        Each weapon should be on a new line in the file.
-
-        Args:
-            file_path (str): The path to the weapons list file.
-
-        Returns:
-            list: A list of weapons (strings), lowercased and stripped.
-        """
+    def _load_weapons(self, file_path: str) -> List[str]:
+        """Loads weapons list from file."""
         try:
-            with open(file_path, 'r') as f:
-                # Read the file line by line, strip whitespace, convert to lowercase
-                # and filter out empty lines.
-                return [line.strip().lower() for line in f if line.strip()]
+            with open(file_path, 'r', encoding='utf-8') as f:
+                weapons = [line.strip().lower() for line in f if line.strip()]
+                logger.info(f"Loaded {len(weapons)} weapons from {file_path}")
+                return weapons
         except FileNotFoundError:
-            print(f"Warning: Weapons file not found at: {file_path}. No weapons loaded.")
+            logger.warning(f"Weapons file not found at: {file_path}. No weapons loaded.")
             return []
         except Exception as e:
-            print(f"Error loading weapons file {file_path}: {e}")
+            logger.error(f"Error loading weapons file {file_path}: {e}")
             return []
 
-    def _get_sentiment_score(self, text):
-        """
-        Calculates the VADER compound sentiment score for a given text.
+    def _ensure_mapping(self):
+        """Ensure the index has the correct mapping for enriched fields."""
+        mapping = {
+            "properties": {
+                "weapons_found": {"type": "keyword"},
+                "sentiment_score": {"type": "float"},
+                "sentiment_label": {"type": "keyword"}
+            }
+        }
+        try:
+            if not self.es.indices.exists(index=self.index_name):
+                self.es.indices.create(index=self.index_name)
+                logger.info(f"Created index: {self.index_name}")
 
-        Args:
-            text (str): The input text for sentiment analysis.
+            # Update mapping (safe even if fields exist)
+            self.es.indices.put_mapping(index=self.index_name, body=mapping)
+            logger.info(f"Mapping ensured for index '{self.index_name}': weapons_found, sentiment_score, sentiment_label")
+        except Exception as e:
+            logger.error(f"Failed to set mapping for index {self.index_name}: {e}")
 
-        Returns:
-            float: The compound sentiment score. Returns 0.0 for non-string input.
-        """
-        if not isinstance(text, str):
-            return 0.0 # Neutral score for invalid input
+    def _get_sentiment_score(self, text: str) -> float:
+        """Calculate VADER compound sentiment score."""
+        if not isinstance(text, str) or not text.strip():
+            return 0.0
         return self.sid.polarity_scores(text)['compound']
 
-    def _get_sentiment_label(self, compound_score):
-        """
-        Maps a VADER compound sentiment score to a descriptive label (positive, negative, neutral).
-
-        Args:
-            compound_score (float): The compound sentiment score.
-
-        Returns:
-            str: "positive", "negative", or "neutral".
-        """
-        if compound_score >= 0.05:
+    def _get_sentiment_label(self, score: float) -> str:
+        """Convert compound score to label."""
+        if score >= 0.05:
             return "positive"
-        elif compound_score <= -0.05:
+        elif score <= -0.05:
             return "negative"
-        else:
-            return "neutral"
+        return "neutral"
 
-    def add_weapons_to_docs(self, size=7000):
-        """
-        Searches for documents containing weapons (from the loaded weapons_list),
-        identifies the specific weapons using Elasticsearch highlighting,
-        and updates the documents in Elasticsearch with a new 'weapons_found' field.
+    def _extract_weapons_from_highlight(self, fragments: List[str]) -> List[str]:
+        """Extract weapon names from highlighted fragments."""
+        found = set()
+        for fragment in fragments:
+            matches = re.findall(r'<weapon>(.*?)</weapon>', fragment, re.IGNORECASE)
+            for match in matches:
+                match_clean = match.strip().lower()
+                # Find exact match from known list
+                matched_weapon = next((w for w in self.weapons_list if w == match_clean), None)
+                if matched_weapon:
+                    found.add(matched_weapon)
+        return list(found)
 
-        Args:
-            size (int): The maximum number of documents to retrieve in one search request.
-                        Adjust based on your dataset size and Elasticsearch configuration.
-        """
-        print(f"[{self.index_name}] Starting weapons enrichment...")
+    def add_weapons_to_docs(self, batch_size: int = 500):
+        """Search for documents containing weapons and enrich with 'weapons_found'."""
+        logger.info(f"[{self.index_name}] Starting weapons enrichment...")
 
         if not self.weapons_list:
-            print(f"[{self.index_name}] No weapons loaded. Skipping weapons enrichment.")
+            logger.warning(f"[{self.index_name}] No weapons loaded. Skipping weapons enrichment.")
             return
 
-        # Build query to match any weapon using match_phrase for accuracy
         query = {
             "query": {
                 "bool": {
-                    "should": [{"match_phrase": {"text": w}} for w in self.weapons_list],
+                    "should": [{"match_phrase": {"text": weapon}} for weapon in self.weapons_list],
                     "minimum_should_match": 1
                 }
             },
-            "_source": False,  # We only need highlights, not the full source document
+            "_source": False,
             "highlight": {
                 "fields": {
                     "text": {
-                        "pre_tags": ["<weapon>"],  # Custom HTML-like tags for easy parsing
+                        "pre_tags": ["<weapon>"],
                         "post_tags": ["</weapon>"],
-                        "fragment_size": 100,      # Size of the text fragment to return
-                        "number_of_fragments": 0,  # 0 means return the full field if multiple matches
-                        "no_match_size": 0         # Don't return fragments if no match
+                        "fragment_size": 150,
+                        "number_of_fragments": 0,
+                        "no_match_size": 0
                     }
                 },
-                "require_field_match": True, # Only highlight if 'text' field matched
-                "boundary_scanner": "word"   # Ensures highlighting respects word boundaries
+                "require_field_match": True,
+                "boundary_scanner": "word"
             }
         }
 
-        print(f"[{self.index_name}] Searching for documents containing weapons...")
         try:
-            res = self.es.search(index=self.index_name, body=query, size=size)
-        except Exception as e:
-            print(f"[{self.index_name}] Error during weapons search: {e}")
-            return
+            docs_to_update = []
+            for hit in helpers.scan(self.es, query=query, index=self.index_name, size=batch_size):
+                doc_id = hit["_id"]
+                if "highlight" in hit and "text" in hit["highlight"]:
+                    weapons = self._extract_weapons_from_highlight(hit["highlight"]["text"])
+                    if weapons:
+                        docs_to_update.append({"_id": doc_id, "weapons": weapons})
 
-        docs_weapons = []
-        for hit in res["hits"]["hits"]:
-            doc_id = hit["_id"]
-            found_weapons_in_doc = set() # Use a set to automatically handle duplicates
+            logger.info(f"[{self.index_name}] Found {len(docs_to_update)} documents with weapons.")
 
-            if "highlight" in hit and "text" in hit["highlight"]:
-                for fragment in hit["highlight"]["text"]:
-                    # Extract highlighted parts using regex
-                    matches = re.findall(r'<weapon>(.*?)</weapon>', fragment, re.IGNORECASE)
-                    for match in matches:
-                        # Normalize the matched weapon to one of your known weapons
-                        # This handles potential casing differences or plural forms if your list is comprehensive
-                        for known_weapon in self.weapons_list:
-                            if known_weapon.lower() == match.lower(): # Case-insensitive comparison
-                                found_weapons_in_doc.add(known_weapon)
-                                break # Found a match, move to the next 'match' from regex
+            if not docs_to_update:
+                logger.info(f"[{self.index_name}] No documents to update with weapons.")
+                return
 
-            if found_weapons_in_doc:
-                docs_weapons.append({"_id": doc_id, "weapons": list(found_weapons_in_doc)})
-
-        print(f"[{self.index_name}] Found {len(docs_weapons)} documents with weapons to update.")
-
-        if not docs_weapons:
-            print(f"[{self.index_name}] No documents with weapons found, skipping update.")
-            return
-
-        print(f"[{self.index_name}] Starting bulk update for 'weapons_found' field...")
-        actions = []
-        for doc in docs_weapons:
-            actions.append({
-                "_op_type": "update",
-                "_index": self.index_name,
-                "_id": doc["_id"],
-                "doc": {
-                    "weapons_found": doc["weapons"] # Add a new field 'weapons_found' with the list
+            actions = [
+                {
+                    "_op_type": "update",
+                    "_index": self.index_name,
+                    "_id": doc["_id"],
+                    "doc": {"weapons_found": doc["weapons"]}
                 }
-            })
+                for doc in docs_to_update
+            ]
 
-        try:
-            # Use helpers.bulk for efficient updates
-            success_count, failed_count = helpers.bulk(
+            success, failed = helpers.bulk(
                 self.es, actions, chunk_size=500, request_timeout=60, raise_on_error=False
             )
-            print(f"[{self.index_name}] Successfully updated {success_count} documents with 'weapons_found'.")
-            if failed_count:
-                print(f"[{self.index_name}] {len(failed_count)} documents failed to update (details in logs if raise_on_error was True).")
+            logger.info(f"[{self.index_name}] Successfully updated {success} documents with weapons.")
+            if failed:
+                logger.warning(f"[{self.index_name}] {len(failed)} documents failed to update (weapons).")
+
+            # Refresh index
+            self.es.indices.refresh(index=self.index_name)
+
         except Exception as e:
-            print(f"[{self.index_name}] An unexpected error occurred during bulk update for weapons: {e}")
+            logger.error(f"[{self.index_name}] Error during weapons enrichment: {e}")
 
-        print(f"[{self.index_name}] Weapons enrichment completed.")
+    def add_sentiment_to_docs(self, batch_size: int = 1000):
+        """Fetch all documents with 'text' and enrich with sentiment."""
+        logger.info(f"[{self.index_name}] Starting sentiment enrichment...")
 
-    def add_sentiment_to_docs(self, size=7000):
-        """
-        Fetches documents that have a 'text' field, calculates their sentiment
-        (score and label), and updates them in Elasticsearch with 'sentiment_score'
-        and 'sentiment_label' fields.
-
-        Args:
-            size (int): The maximum number of documents to retrieve in one search request.
-        """
-        print(f"[{self.index_name}] Starting sentiment enrichment...")
-
-        # Query to retrieve documents that have a 'text' field.
-        # In a production scenario, you might want to specifically query for documents
-        # that *do not* yet have 'sentiment_label' to avoid re-processing.
         query = {
             "query": {
-                "exists": {
-                    "field": "text"
+                "bool": {
+                    "must": [{"exists": {"field": "text"}}],
+                    "must_not": [{"exists": {"field": "sentiment_label"}}]  # Avoid reprocessing
                 }
             },
-            "_source": ["text"] # We need the actual text content for analysis
+            "_source": ["text"]
         }
 
-        print(f"[{self.index_name}] Fetching documents for sentiment analysis...")
         try:
-            res = self.es.search(index=self.index_name, body=query, size=size)
-        except Exception as e:
-            print(f"[{self.index_name}] Error during sentiment data fetch: {e}")
-            return
+            docs_to_update = []
+            for hit in helpers.scan(self.es, query=query, index=self.index_name, size=batch_size):
+                doc_id = hit["_id"]
+                text = hit.get("_source", {}).get("text")
+                if text:
+                    score = self._get_sentiment_score(text)
+                    label = self._get_sentiment_label(score)
+                    docs_to_update.append({
+                        "_id": doc_id,
+                        "sentiment_score": score,
+                        "sentiment_label": label
+                    })
+                else:
+                    logger.debug(f"[{self.index_name}] Doc {doc_id} has no text field.")
 
-        docs_to_update = []
-        for hit in res["hits"]["hits"]:
-            doc_id = hit["_id"]
-            text = hit["_source"].get("text") # Safely retrieve 'text' field
+            logger.info(f"[{self.index_name}] Prepared {len(docs_to_update)} documents for sentiment update.")
 
-            if text:
-                compound_score = self._get_sentiment_score(text)
-                sentiment_label = self._get_sentiment_label(compound_score)
-                docs_to_update.append({
-                    "_id": doc_id,
-                    "sentiment_score": compound_score,
-                    "sentiment_label": sentiment_label
-                })
-            else:
-                print(f"[{self.index_name}] Warning: Document {doc_id} has no 'text' field for sentiment analysis.")
+            if not docs_to_update:
+                logger.info(f"[{self.index_name}] No documents need sentiment update.")
+                return
 
+            actions = [
+                {
+                    "_op_type": "update",
+                    "_index": self.index_name,
+                    "_id": doc["_id"],
+                    "doc": {
+                        "sentiment_score": doc["sentiment_score"],
+                        "sentiment_label": doc["sentiment_label"]
+                    }
+                }
+                for doc in docs_to_update
+            ]
 
-        print(f"[{self.index_name}] Prepared {len(docs_to_update)} documents for sentiment update.")
-
-        if not docs_to_update:
-            print(f"[{self.index_name}] No documents to analyze for sentiment, skipping update.")
-            return
-
-        print(f"[{self.index_name}] Starting bulk update for sentiment fields...")
-        actions = []
-        for doc_data in docs_to_update:
-            doc_id = doc_data.pop("_id") # Remove _id from the dict as it's for the bulk operation, not the doc content
-            actions.append({
-                "_op_type": "update",
-                "_index": self.index_name,
-                "_id": doc_id,
-                "doc": doc_data # This dict now contains 'sentiment_score' and 'sentiment_label'
-            })
-
-        try:
-            success_count, failed_count = helpers.bulk(
+            success, failed = helpers.bulk(
                 self.es, actions, chunk_size=500, request_timeout=60, raise_on_error=False
             )
-            print(f"[{self.index_name}] Successfully updated {success_count} documents with sentiment.")
-            if failed_count:
-                print(f"[{self.index_name}] {len(failed_count)} documents failed to update (details in logs if raise_on_error was True).")
-        except Exception as e:
-            print(f"[{self.index_name}] An unexpected error occurred during bulk update for sentiment: {e}")
+            logger.info(f"[{self.index_name}] Sentiment: {success} updated, {len(failed) if failed else 0} failed.")
+            self.es.indices.refresh(index=self.index_name)
 
-        print(f"[{self.index_name}] Sentiment enrichment completed.")
+        except Exception as e:
+            logger.error(f"[{self.index_name}] Error during sentiment enrichment: {e}")
+
+    def test_single_doc(self, doc_id: str) -> Dict:
+        """Helper: Test a single document – return its content and enrichments."""
+        try:
+            doc = self.es.get(index=self.index_name, id=doc_id)
+            source = doc["_source"]
+            logger.info(f"Document {doc_id} content: {source.get('text', '')[:200]}...")
+            logger.info(f"Current enrichment: weapons_found={source.get('weapons_found')}, "
+                        f"sentiment_label={source.get('sentiment_label')}, "
+                        f"sentiment_score={source.get('sentiment_score')}")
+            return source
+        except Exception as e:
+            logger.error(f"Could not retrieve document {doc_id}: {e}")
+            return {}
+
+    def verify_enrichment(self) -> Dict[str, int]:
+        """Verify how many documents have enriched fields."""
+        try:
+            res_weapons = self.es.count(
+                index=self.index_name,
+                body={"query": {"exists": {"field": "weapons_found"}}}
+            )["count"]
+
+            res_sentiment = self.es.count(
+                index=self.index_name,
+                body={"query": {"exists": {"field": "sentiment_label"}}}
+            )["count"]
+
+            total = self.es.count(index=self.index_name)["count"]
+
+            logger.info(f"Verification: {res_weapons}/{total} have weapons_found, "
+                        f"{res_sentiment}/{total} have sentiment_label")
+            return {
+                "total": total,
+                "weapons_found": res_weapons,
+                "sentiment_label": res_sentiment
+            }
+        except Exception as e:
+            logger.error(f"Verification failed: {e}")
+            return {}
