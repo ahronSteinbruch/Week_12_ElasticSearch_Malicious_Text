@@ -263,3 +263,67 @@ class Enriche:
         except Exception as e:
             logger.error(f"Verification failed: {e}")
             return {}
+
+    def preview_delete_by_query(self, query: dict, size: int = 10):
+        """Preview documents that match the delete query."""
+        try:
+            res = self.es.search(
+                index=self.index_name,
+                body={"query": query, "_source": ["text", "Antisemitic", "sentiment_label", "weapons_found"]},
+                size=size
+            )
+            logger.info(f"Preview of up to {size} documents that would be deleted:")
+            for hit in res["hits"]["hits"]:
+                logger.info(f"  ID: {hit['_id']} | Text: {hit['_source']['text'][:100]}...")
+            return res["hits"]["total"]["value"]
+        except Exception as e:
+            logger.error(f"Error in preview: {e}")
+            return 0
+
+    def clean_non_antisemitic(self):
+        """
+        Deletes non-antisemitic tweets that:
+        - Do NOT contain weapons (weapons_found is missing or empty)
+        - Have positive or neutral sentiment (sentiment_label is 'positive' or 'neutral')
+
+        These are considered non-harmful and not relevant for antisemitism monitoring.
+        """
+        logger.info(f"[{self.index_name}] Starting cleanup of non-antisemitic, non-threatening tweets...")
+
+        query = {
+            "bool": {
+                "must": [
+                    {"term": {"Antisemitic": 0}},
+                    {"term": {"sentiment_label": "positive"}}  # Includes positive and neutral
+                ],
+                "must_not": [
+                    {"exists": {"field": "weapons_found"}}  # No weapons found
+                ]
+            }
+        }
+
+        # Also include neutral sentiment
+        # We'll run two queries or use a should clause
+        full_query = {
+            "bool": {
+                "must": [
+                    {"term": {"Antisemitic": 0}},
+                    {
+                        "bool": {
+                            "should": [
+                                {"term": {"sentiment_label": "positive"}},
+                                {"term": {"sentiment_label": "neutral"}}
+                            ],
+                            "minimum_should_match": 1
+                        }
+                    }
+                ],
+                "must_not": [
+                    {"exists": {"field": "weapons_found"}}
+                ]
+            }
+        }
+
+        deleted = self.dal.delete_by_query(full_query)
+        logger.info(
+            f"[{self.index_name}] Cleanup completed. Removed {deleted} non-antisemitic, non-threatening tweets.")

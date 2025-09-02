@@ -15,3 +15,5 @@ if __name__ == "__main__":
     enricher.add_weapons_to_docs() # Adjust size as needed for your dataset
     # Run the sentiment enrichment process
     enricher.add_sentiment_to_docs() # Adjust size as needed
+
+    enricher.clean_non_antisemitic()
